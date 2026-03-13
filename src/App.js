@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
+import { supabase } from "./supabase";
 
 /* ═══════════════════════════════════════════════════════════════════════
    MATHS TERMINALE — Plateforme Prof / Élève
@@ -574,7 +575,7 @@ const CHAPTERS = [
 ];
 const THEMES = [...new Set(CHAPTERS.map(c => c.theme))];
 const TC = {"Analyse":"#8b5cf6","Probabilités & Statistiques":"#f97316","Géométrie":"#0ea5e9"};
-const CONFIG = {prof:{name:"Professeur",pin:"1234"},eleve:{name:"Sami",pin:"0000"},appTitle:"Maths Terminale"};
+const CONFIG = {prof:{name:"Imran",pin:"1234"},eleve:{name:"Sami",pin:"0000"},appTitle:"Maths Terminale"};
 
 // ─── PARCOURS GUIDÉ ─────────────────────────────────────────
 const LEARNING_PATH = [
@@ -595,19 +596,22 @@ const LEARNING_PATH = [
 ];
 const PATH_MAP = Object.fromEntries(LEARNING_PATH.map(p => [p.id, p]));
 
-// ─── SUPABASE (remplir plus tard) ─────────────────────────
-const SB_URL = "";
-const SB_KEY = "";
-
-// ─── STORAGE (auto-detect: window.storage → localStorage) ──
+// ─── STORAGE (Supabase → window.storage → localStorage) ───
 async function dbGet(k){
-  try{ if(window.storage){const r=await window.storage.get(k);return r&&r.value?JSON.parse(r.value):null;} }catch{}
-  try{ const v=localStorage.getItem(k);return v?JSON.parse(v):null; }catch{ return null; }
+  // 1. Supabase (si configuré)
+  if(supabase){try{const{data}=await supabase.from("classroom_data").select("value").eq("key",k).maybeSingle();if(data)return data.value;}catch(e){console.warn("Supabase read error",e);}}
+  // 2. window.storage (IndexedDB natif si dispo)
+  try{if(window.storage){const r=await window.storage.get(k);return r&&r.value?JSON.parse(r.value):null;}}catch{}
+  // 3. localStorage (fallback ultime)
+  try{const v=localStorage.getItem(k);return v?JSON.parse(v):null;}catch{return null;}
 }
 async function dbSet(k,v){
+  // 1. Supabase (si configuré)
+  if(supabase){try{await supabase.from("classroom_data").upsert({key:k,value:v,updated_at:new Date().toISOString()},{onConflict:"key"});}catch(e){console.warn("Supabase write error",e);}}
+  // 2. localStorage (cache local)
   const s=JSON.stringify(v);
-  try{ if(window.storage){await window.storage.set(k,s);return;} }catch{}
-  try{ localStorage.setItem(k,s); }catch{}
+  try{if(window.storage){await window.storage.set(k,s);return;}}catch{}
+  try{localStorage.setItem(k,s);}catch{}
 }
 
 // ─── COMPONENTS ─────────────────────────────────────────────
@@ -654,6 +658,7 @@ export default function App(){
   const [weekGoals,setWeekGoals]=useState([]);
   const [goalDraft,setGoalDraft]=useState("");
   const [timeSpent,setTimeSpent]=useState({});
+  const [dbOnline,setDbOnline]=useState(false);
   const chatRef=useRef(null);
   const fileRef=useRef(null);
   const exoFileRef=useRef(null);
@@ -672,9 +677,32 @@ export default function App(){
     if(ce&&typeof ce==="object"&&!Array.isArray(ce))setCustomExos(ce);
     if(Array.isArray(wg))setWeekGoals(wg);
     if(ts&&typeof ts==="object"&&!Array.isArray(ts))setTimeSpent(ts);
+    if(supabase)setDbOnline(true);
   }catch(e){console.log("load err",e);}})();},[]);
 
   const sv=useCallback((k,v)=>{dbSet(k,v);},[]);
+
+  // ─── SUPABASE REALTIME ────────────────────────────────────
+  useEffect(()=>{
+    if(!supabase)return;
+    const applyKey=(key,val)=>{
+      if(key==="mt-msgs"&&Array.isArray(val))setMsgs(val);
+      else if(key==="mt-files"&&Array.isArray(val))setFiles(val);
+      else if(key==="mt-prog"&&val&&typeof val==="object"&&!Array.isArray(val))setProg(val);
+      else if(key==="mt-exos"&&val&&typeof val==="object"&&!Array.isArray(val))setCustomExos(val);
+      else if(key==="mt-goals"&&Array.isArray(val))setWeekGoals(val);
+      else if(key==="mt-time"&&val&&typeof val==="object"&&!Array.isArray(val))setTimeSpent(val);
+    };
+    const channel=supabase.channel("classroom-realtime")
+      .on("postgres_changes",{event:"*",schema:"public",table:"classroom_data"},(payload)=>{
+        const key=payload.new?.key||payload.old?.key;
+        const val=payload.new?.value;
+        if(key&&val!==undefined)applyKey(key,val);
+        else if(key)dbGet(key).then(v=>{if(v!==null)applyKey(key,v);});
+      })
+      .subscribe((status)=>{setDbOnline(status==="SUBSCRIBED");});
+    return()=>{supabase.removeChannel(channel);};
+  },[]);
 
   // ─── TIMER ────────────────────────────────────────────────
   const stopT=()=>{if(timerRef.current&&chRef.current){const e=Math.round((Date.now()-timerRef.current)/1000);if(e>5){const n={...tsRef.current,[chRef.current.id]:(tsRef.current[chRef.current.id]||0)+e};setTimeSpent(n);sv("mt-time",n);}}timerRef.current=0;};
@@ -703,8 +731,23 @@ export default function App(){
   const saveExo=()=>{if(!exoForm.title||!exoForm.chapter||(!exoForm.statement&&!exoForm.file))return;const id=exoForm.chapter;const ne={...customExos,[id]:[...(customExos[id]||[]),{title:exoForm.title,statement:exoForm.statement||"(voir document)",hint:exoForm.hint,solution:exoForm.solution,file:exoForm.file,fileName:exoForm.fileName,fileType:exoForm.fileType,byProf:true,ts:new Date().toISOString()}]};setCustomExos(ne);sv("mt-exos",ne);setExoForm({title:"",statement:"",hint:"",solution:"",chapter:"",file:null,fileName:"",fileType:""});if(exoFileRef.current)exoFileRef.current.value="";};
   const delExo=(id,i)=>{const ne={...customExos,[id]:customExos[id].filter((_,j)=>j!==i)};setCustomExos(ne);sv("mt-exos",ne);};
 
-  // ─── AI CHAT ──────────────────────────────────────────────
-  const sendAi=async()=>{if(!aiInput.trim()||aiLoading)return;const um=aiInput.trim();setAiInput("");const nm=[...aiMsgs,{role:"user",content:um}];setAiMsgs(nm);setAiLoading(true);try{const r=await fetch("https://api.anthropic.com/v1/messages",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({model:"claude-sonnet-4-20250514",max_tokens:1000,system:"Tu es un tuteur bienveillant spécialisé maths Terminale français. Explique clairement, étape par étape. Utilise Unicode math. Réponds en français.",messages:nm.map(m=>({role:m.role==="assistant"?"assistant":"user",content:m.content}))})});const d=await r.json();const reply=d.content?.map(c=>c.text||"").join("")||"Erreur.";const f=[...nm,{role:"assistant",content:reply}];setAiMsgs(f);sv("mt-ai",f);}catch{setAiMsgs([...nm,{role:"assistant",content:"⚠️ Erreur de connexion."}]);}setAiLoading(false);};
+  // ─── AI CHAT (Groq — gratuit) ─────────────────────────────
+  const sendAi=async()=>{
+    if(!aiInput.trim()||aiLoading)return;
+    const apiKey=process.env.REACT_APP_GROQ_API_KEY||"";
+    if(!apiKey){setAiMsgs(p=>[...p,{role:"assistant",content:"⚠️ Clé API manquante. Ajoute REACT_APP_GROQ_API_KEY dans ton fichier .env"}]);return;}
+    const um=aiInput.trim();setAiInput("");
+    const nm=[...aiMsgs,{role:"user",content:um}];
+    setAiMsgs(nm);setAiLoading(true);
+    try{
+      const r=await fetch("https://api.groq.com/openai/v1/chat/completions",{method:"POST",headers:{"Content-Type":"application/json","Authorization":"Bearer "+apiKey},body:JSON.stringify({model:"llama-3.1-70b-versatile",max_tokens:1024,messages:[{role:"system",content:"Tu es un tuteur bienveillant spécialisé en mathématiques de Terminale (programme français). Tu expliques clairement, étape par étape, avec des exemples concrets. Tu utilises les symboles Unicode mathématiques (∑, ∫, √, π, ∞, ≤, ≥). Tu réponds toujours en français."}, ...nm.map(m=>({role:m.role==="assistant"?"assistant":"user",content:m.content}))]})});
+      const d=await r.json();
+      if(!r.ok)throw new Error(d.error?.message||"Erreur API Groq");
+      const reply=d.choices?.[0]?.message?.content||"Erreur.";
+      const f=[...nm,{role:"assistant",content:reply}];setAiMsgs(f);sv("mt-ai",f);
+    }catch(err){setAiMsgs(p=>[...p,{role:"assistant",content:"⚠️ "+err.message}]);}
+    setAiLoading(false);
+  };
   useEffect(()=>{chatRef.current?.scrollTo(0,chatRef.current.scrollHeight);},[aiMsgs]);
 
   // ─── WEEKLY GOALS ─────────────────────────────────────────
@@ -751,6 +794,7 @@ export default function App(){
     <button onClick={()=>navTo("inbox")} style={navBtnStyle(page==="inbox")}>💬 Messages{unread>0?<span style={{background:"#ef4444",color:"white",borderRadius:10,padding:"1px 6px",fontSize:10,fontWeight:700,marginLeft:4}}>{unread}</span>:null}</button>
     {isProf?<button onClick={()=>navTo("dashboard")} style={navBtnStyle(page==="dashboard")}>📊 Suivi</button>:null}
     {isProf?<button onClick={()=>navTo("create-exo")} style={navBtnStyle(page==="create-exo")}>➕ Créer exo</button>:null}
+    <span title={dbOnline?"Supabase connecté — temps réel actif":"Mode hors-ligne (localStorage)"} style={{display:"inline-flex",alignItems:"center",gap:5,padding:"6px 12px",borderRadius:20,fontSize:11,fontWeight:700,background:dbOnline?"#f0fdf4":"#fafafa",border:"1px solid "+(dbOnline?"#bbf7d0":"#e2e8f0"),color:dbOnline?"#16a34a":"#94a3b8",cursor:"default",flexShrink:0}}><span style={{width:7,height:7,borderRadius:"50%",background:dbOnline?"#22c55e":"#cbd5e1",display:"inline-block",boxShadow:dbOnline?"0 0 0 2px #dcfce7":""}} />{dbOnline?"Sync":"Local"}</span>
     <button onClick={()=>{stopT();setUser(null);setPage("home");}} style={{...navBtnStyle(false),flex:"0 0 auto",color:"#ef4444"}}>🚪</button>
   </div>;
 
